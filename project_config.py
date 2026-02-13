@@ -3,10 +3,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-NEO4J_URI="neo4j+s://91da1fda.databases.neo4j.io"
-NEO4J_USER="neo4j"
-NEO4J_PASSWORD="CDEenHZbTMIKTm9p7I1S0Slb4V5u_0zOPfCcxDd3Kj0"
-EMAIL="aritribaidya8@gmail.com"
+NEO4J_URI="YOUR URI ID"
+NEO4J_USER="USER NAME"
+NEO4J_PASSWORD="YOUR PASSWORD"
+EMAIL="YOURMAILID@gmail.com"
 
 
 
@@ -16,9 +16,10 @@ EMAIL="aritribaidya8@gmail.com"
 # from neo4j import GraphDatabase
 #
 # driver = GraphDatabase.driver(
-#     "neo4j+s://91da1fda.databases.neo4j.io",
-#     auth=("neo4j","CDEenHZbTMIKTm9p7I1S0Slb4V5u_0zOPfCcxDd3Kj0")
+#     "YOUR URI ID",
+#     auth=("USER NAME","YOUR PASSWORD")
 # )
 #
 # with driver.session() as s:
 #     print(s.run("RETURN 'Connected!'").single())
+
