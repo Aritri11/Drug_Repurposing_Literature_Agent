@@ -1,0 +1,11 @@
+langchain
+langgraph
+transformers
+sentence-transformers
+faiss-cpu
+neo4j
+biopython
+streamlit
+torch
+accelerate
+python-dotenv
