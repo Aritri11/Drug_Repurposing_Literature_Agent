@@ -48,6 +48,7 @@ class GeneDirection(BaseModel):
     gene: str
     direction: Direction
     evidence_type: EvidenceType
+    pmid: str
 
 class GeneDirectionList(RootModel[List[GeneDirection]]):
     pass
@@ -93,10 +94,11 @@ def fetch_pubmed_abstracts(disease: str, max_results: int = 20):
     # Safely parse the XML for abstracts
     for article in records['PubmedArticle']:
         try:
+            pmid = str(article['MedlineCitation']['PMID'])  # ← extract PMID
             abstract_text = article['MedlineCitation']['Article']['Abstract']['AbstractText']
             # Sometimes abstracts are split into sections (Background, Methods, etc.)
             full_abstract = " ".join([str(text) for text in abstract_text])
-            abstract_list.append(full_abstract)
+            abstract_list.append({"pmid": pmid, "abstract": full_abstract})
         except KeyError:
             # Skip if the paper has no abstract
             continue
@@ -128,20 +130,26 @@ def extract_baseline_dysregulation(disease: str, abstract_list: list):
     - evidence_type must be:
         "BASELINE" if naturally dysregulated in disease
         "INTERVENTION" if altered due to treatment or compound
+    - For pmid field, use exactly this value: {{pmid_placeholder}}
 
     Return structured output only.
     """
 
     # Wrap the list in tqdm for a nice progress bar
-    for i, abstract in enumerate(tqdm(abstract_list, desc="Processing Abstracts")):
+    for i, item in enumerate(tqdm(abstract_list, desc="Processing Abstracts")):
+        pmid = item["pmid"]  # ← unpack
+        abstract = item["abstract"]  # ← unpack
         try:
+            filled_prompt = prompt.replace("{pmid_placeholder}", pmid)  # ← inject pmid
             # We process ONE abstract at a time
-            result = structured_llm.invoke(prompt + "\n\nAbstract:\n" + abstract)
+            result = structured_llm.invoke(filled_prompt + "\n\nAbstract:\n" + abstract)
 
             # Check if it actually found anything
             if result and result.root:
-                for item in result.root:
-                    all_extracted.append(item.model_dump(mode="json"))
+                for entry in result.root:
+                    data = entry.model_dump(mode="json")
+                    data["pmid"] = pmid  # ← force correct pmid (don't trust LLM)
+                    all_extracted.append(data)
 
         except Exception as e:
             print(f"\nStructured extraction failed on abstract {i + 1}: {e}")
@@ -221,7 +229,7 @@ if __name__ == "__main__":
     results = run_extraction_pipeline(disease)
     print(results)
 
-#
+####################################################################################################################################
 #
 # def fetch_pubmed_records(disease: str, max_results: int = 5):
 #     search_term = f"""
