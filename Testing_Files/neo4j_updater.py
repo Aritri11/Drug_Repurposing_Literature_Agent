@@ -79,12 +79,24 @@ def update_graph_for_disease(disease: str, max_results: int = 20):
 
     query = """
     MERGE (d:Disease {name:$disease})
-    MERGE (g:Gene {symbol:$gene})
-
-    MERGE (d)-[r:ALTERS_EXPRESSION]->(g)
-    SET r.direction = $direction,
-        r.evidence_count = 1,
-        r.confidence_score = 0.1
+MERGE (g:Gene {symbol:$gene})
+MERGE (d)-[r:ALTERS_EXPRESSION]->(g)
+SET r.direction = $direction,
+    r.pmids = CASE
+                WHEN r.pmids IS NULL THEN [$pmid]
+                WHEN NOT $pmid IN r.pmids THEN r.pmids + $pmid
+                ELSE r.pmids
+              END,
+    r.evidence_count = CASE
+                WHEN r.pmids IS NULL THEN 1
+                WHEN NOT $pmid IN r.pmids THEN size(r.pmids) + 1
+                ELSE size(r.pmids)
+              END,
+    r.confidence_score = CASE
+                WHEN r.pmids IS NULL THEN 0.1
+                WHEN NOT $pmid IN r.pmids THEN (size(r.pmids) + 1) * 0.1
+                ELSE size(r.pmids) * 0.1
+    END
     """
 
     inserted_count = 0
@@ -101,7 +113,8 @@ def update_graph_for_disease(disease: str, max_results: int = 20):
                 query,
                 disease=disease,
                 gene=item["gene"],
-                direction=item["direction"]
+                direction=item["direction"],
+                pmid=item["pmid"]
             )
 
     driver.close()
