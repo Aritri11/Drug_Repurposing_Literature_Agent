@@ -125,6 +125,26 @@ def validate_gene(item: dict) -> Optional[dict]:
 
 
 # ======================================================
+# 🔧 Helper: Compute evidence strength
+# ======================================================
+
+def get_evidence_strength(score: float) -> str:
+    """
+    Compute evidence strength label based on pre-computed score.
+
+    Score ranges:
+        70 - 100  → High
+        40 - 69   → Medium
+        0  - 39   → Low
+    """
+    if score >= 70:
+        return "🟢 High"
+    elif score >= 40:
+        return "🟡 Medium"
+    else:
+        return "🔴 Low"
+
+# ======================================================
 # 🔧 Helper: DGIdb batch API call
 # ======================================================
 
@@ -234,7 +254,7 @@ def pubmed_node(state: AgentState) -> AgentState:
 
     search_term = f"""
     {disease}[Title/Abstract]
-    AND ("expression level" OR upregulated OR downregulated)
+    AND ("expression level" OR "gene expression" OR "differential expression" OR upregulated OR downregulated)
     """
 
     try:
@@ -633,6 +653,8 @@ def reasoning_node(state: AgentState) -> AgentState:
                 )
 
             approved_label = "✅ FDA Approved" if row.get("drug_approved") else "🔬 Experimental"
+            # Compute evidence strength programmatically
+            evidence_strength = get_evidence_strength(row["computed_score"])
             conflicted = row.get("conflicted", False)
             conflict_label = " ⚠️ CONFLICTED DIRECTION" if conflicted else ""
             line = (
@@ -644,6 +666,7 @@ def reasoning_node(state: AgentState) -> AgentState:
                 f"Direction match: {direction_label} | "
                 f"Evidence count: {row['evidence_count']} | "
                 f"Pre-computed score: {row['computed_score']}/100 | "
+                f"Evidence Strength: {evidence_strength} | "
                 f"PMIDs: {', '.join(row['pmids'] or [])}"
             )
             evidence_lines.append(line)
@@ -700,7 +723,7 @@ RANK X:
 - Gene's Role in {disease}: [explanation]
 - Direction Match: [copy exactly from evidence — includes gene direction and drug action]
 - Pre-computed Score (Confidence Score[0-100]): [copy exactly from evidence]
-- Evidence Strength: High / Medium / Low
+- Evidence Strength: [copy exactly from evidence — 🟢 High / 🟡 Medium / 🔴 Low]
 - Supporting PMIDs: [copy exactly]
 - Recommended next Step: [recommendation]
 
