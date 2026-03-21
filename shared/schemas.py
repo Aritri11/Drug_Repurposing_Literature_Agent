@@ -6,6 +6,7 @@ from typing_extensions import TypedDict
 from shared.config import llm_ner, llm_reasoning
 
 
+
 # ======================================================
 # 📦 Pydantic Schemas
 # ======================================================
@@ -26,6 +27,7 @@ class GeneDirection(BaseModel):
 
 class GeneDirectionList(RootModel[List[GeneDirection]]):
     pass
+
 
 structured_llm = llm_ner.with_structured_output(GeneDirectionList)
 
