@@ -19,7 +19,7 @@ An agentic pipeline that uses large language models, knowledge graphs, and retri
 ```text
 drug-repurposing-agent/
 │
-├── agents/
+├── shared/
 │   ├── config.py    # Configuration (API keys, model names, Neo4j, etc.)       
 │   ├── helpers.py          
 │   ├── schemas.py         
