@@ -1,10 +1,10 @@
 #config.py
 import os
+import time
 from dotenv import load_dotenv
 from Bio import Entrez
 from langchain_ollama import ChatOllama
 from neo4j import GraphDatabase
-import time
 
 load_dotenv()
 
@@ -27,35 +27,49 @@ def get_neo4j_driver():
     )
 
 # ── LLM ─────────────────────────────────────────────────
-# llm_ner = ChatOllama(
-#     model="gpt-oss:20b-cloud",
-#     base_url="http://127.0.0.1:11434",  # ← your local Ollama server
-#     headers={"Authorization": "Bearer " + os.getenv("OLLAMA_API_KEY", "")},
-#     temperature=0
-# )
-# NER extraction
-
-llm_ner= ChatOllama(model="llama3.1:8b",   temperature=0)  # NER extraction
-
-llm_reasoning = ChatOllama(model="deepseek-r1:8b",   temperature=0)  # Reasoning/report
+# keep_alive=-1 tells Ollama to NEVER unload this model from VRAM.
+# Without this, Ollama resets the timer on every inference request
+# back to the default 5 minutes — causing mid-pipeline unloads.
+llm_ner       = ChatOllama(model="llama3.1:8b",    temperature=0, keep_alive=-1)
+llm_reasoning = ChatOllama(model="deepseek-r1:8b", temperature=0, keep_alive=-1)
 
 
 # ======================================================
 # 🔥 Model Warmup
-# Forces Ollama to fully load the model into VRAM before
-# the pipeline starts firing parallel requests.
-# Without this, parallel threads hit an unloaded model
-# → CUDA error (status code: 500).
 # ======================================================
+
+def free_reasoning_model():
+    """
+    Unload deepseek-r1:8b from VRAM before the NER phase starts.
+    During NER, only llama3.1:8b is needed. Keeping deepseek-r1:8b
+    loaded consumes ~5GB VRAM and leaves no room for llama3.1:8b
+    to reload if it gets evicted, causing 60s+ reload timeouts.
+    Call this after warmup, before graph.invoke().
+    """
+    import requests
+    try:
+        r = requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": "deepseek-r1:8b", "keep_alive": 0, "prompt": "", "stream": False},
+            timeout=10
+        )
+        if r.status_code == 200:
+            print("🧹 deepseek-r1:8b unloaded from VRAM — freeing space for NER phase")
+        else:
+            print(f"⚠️  Could not unload deepseek-r1:8b: {r.status_code}")
+    except Exception as e:
+        print(f"⚠️  deepseek-r1:8b unload failed (non-fatal): {e}")
+
 
 def warmup_models(retries: int = 5, delay: float = 3.0):
     """
     Send a minimal dummy request to each model to ensure they are
     fully loaded into GPU memory before parallel inference begins.
-    Retries on failure with a delay to allow Ollama time to recover.
+    The keep_alive=-1 in the ChatOllama definition means every
+    warmup call also sets the model to never-unload.
     """
     models = [
-        ("llm_ner (gpt-oss:20b-cloud)", llm_ner),
+        ("llm_ner (llama3.1:8b)",          llm_ner),
         ("llm_reasoning (deepseek-r1:8b)", llm_reasoning),
     ]
 
