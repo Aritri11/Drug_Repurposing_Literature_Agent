@@ -2,7 +2,7 @@
 ╔══════════════════════════════════════════════════════════════╗
 ║         Drug Repurposing LangGraph Agent Pipeline            ║
 ║                                                              ║
-║  Agents:                                                      ║
+║  Agents:                                                     ║
 ║   1. pubmed_node       → Fetch PubMed abstracts              ║
 ║   2. ner_node          → Extract disease-gene relationships  ║
 ║   3. dgidb_node        → Fetch drug-gene interactions        ║
@@ -13,13 +13,15 @@
 
 import sys
 from langgraph.graph import StateGraph, END
-
+from shared.config import warmup_models, free_reasoning_model
 from shared.schemas import AgentState
 from agents.pubmed_node    import pubmed_node
 from agents.ner_node       import ner_node
 from agents.dgidb_node     import dgidb_node
 from agents.kg_node        import kg_node
 from agents.reasoning_node import reasoning_node
+
+
 
 
 # ======================================================
@@ -68,6 +70,9 @@ if __name__ == "__main__":
 
     print(f"\n🚀 Starting Drug Repurposing Agent for: '{disease_input}'")
     print("="*60)
+
+    warmup_models()
+    free_reasoning_model()
 
     pipeline    = build_pipeline()
     final_state = pipeline.invoke({
