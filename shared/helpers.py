@@ -5,8 +5,16 @@ from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import mygene
 
-from shared.schemas import structured_llm
+import re
+import nltk
+from nltk.tokenize import sent_tokenize
 
+from shared.schemas import structured_llm
+from shared.config import llm_ner as _llm_ner  # used to read model name only
+_NER_MODEL = _llm_ner.model  # e.g. "llama3.1:8b" — read once at import time
+
+import threading
+_OLLAMA_RESET_LOCK = threading.Lock()
 # How long to wait for a single LLM call before declaring it hung (seconds)
 LLM_CALL_TIMEOUT = 90
 
@@ -245,109 +253,343 @@ Abstract: {abstract}
 Return structured output only. If nothing qualifies, return an empty list."""
 
 
+# ======================================================
+# 🔧 Helper: Reset Ollama model after a hung request
+#
+# When an LLM call times out, Ollama is still processing
+# the hung request internally. Any new request queues behind
+# it and also times out. The fix is to:
+#   1. Unload the model (keep_alive=0) — kills the hung request
+#   2. Reload the model (keep_alive=-1) — fresh start, no queue
+#
+# This takes ~5-10s but prevents cascading timeouts on all
+# subsequent abstracts after a single hung one.
+# ======================================================
+
+def _reset_ollama_model(model: str = None, wait_before_reload: float = 3.0):
+    """
+    Force-reset Ollama model to clear stuck/hung generations:
+      1) unload model   (keep_alive=0)
+      2) short wait
+      3) reload model   (tiny prompt, keep_alive=-1)
+    """
+    if model is None:
+        model = _NER_MODEL
+
+    try:
+        import requests as _req
+
+        print(f"             🔄 Resetting Ollama model: {model}")
+
+        # 1) Unload model (kills queued/hung work for this model)
+        try:
+            r_unload = _req.post(
+                "http://localhost:11434/api/generate",
+                json={
+                    "model": model,
+                    "prompt": "",        # empty prompt is fine for keep_alive control
+                    "stream": False,
+                    "keep_alive": 0
+                },
+                timeout=20
+            )
+            print(f"             📤 Unload status: {r_unload.status_code}")
+        except Exception as e:
+            print(f"             ⚠️  Unload request failed: {e}")
+
+        # 2) brief pause so Ollama can finalize unload
+        time.sleep(wait_before_reload)
+
+        # 3) Reload + warm model in memory
+        try:
+            r_reload = _req.post(
+                "http://localhost:11434/api/generate",
+                json={
+                    "model": model,
+                    "prompt": "OK",
+                    "stream": False,
+                    "keep_alive": -1
+                },
+                timeout=60
+            )
+            if r_reload.status_code == 200:
+                print("             ✅ Ollama model reloaded and responsive")
+            else:
+                print(f"             ⚠️  Reload returned status {r_reload.status_code}")
+        except Exception as e:
+            print(f"             ⚠️  Reload request failed: {e}")
+
+    except Exception as e:
+        print(f"             ⚠️  Ollama reset failed (non-fatal): {e}")
+
+# ── Keywords that signal an abstract is worth processing ─────────────────────
+# Abstract must contain at least one expression-change word to be worth
+# sending to PubTator3 or the LLM. Abstracts about drug mechanisms,
+# reviews, or gene therapy with no dysregulation language are skipped early.
+_DYSREGULATION_KEYWORDS = {
+    "upregulated", "downregulated", "overexpressed", "underexpressed",
+    "increased expression", "decreased expression", "elevated", "reduced",
+    "suppressed", "activated", "inhibited", "silenced", "knocked down",
+    "knockdown", "upregulation", "downregulation", "overexpression",
+    "dysregulated", "dysregulation", "differentially expressed",
+    "higher expression", "lower expression", "gene expression",
+}
+
+def _abstract_has_dysregulation(abstract: str) -> bool:
+    """
+    Fast keyword pre-filter — returns True if the abstract contains
+    at least one expression-change term. Skips PubTator3 + LLM calls
+    for abstracts that clearly have no dysregulation content.
+    """
+    text = abstract.lower()
+    return any(kw in text for kw in _DYSREGULATION_KEYWORDS)
+
+
+# ======================================================
+# 🔧 Helper: Extract relevant sentences (token reduction)
+# ======================================================
+
+def extract_relevant_sentences(abstract: str, genes: list[str] = None, max_sentences: int = 5) -> str:
+    """
+    Extract only sentences with gene mentions + dysregulation keywords.
+    Reduces token count sent to LLM by 60–80%.
+
+    Args:
+        abstract: Full abstract text
+        genes: List of gene names to look for (whitelist)
+        max_sentences: Cap output at this many sentences
+
+    Returns:
+        Compact string of relevant sentences only
+    """
+    sentences = sent_tokenize(abstract)
+
+    if not sentences:
+        return abstract  # Fallback if tokenization fails
+
+    dysregulation_terms = {
+        "upregulated", "downregulated", "overexpressed", "underexpressed",
+        "increased", "decreased", "elevated", "reduced", "suppressed",
+        "activated", "inhibited", "silenced", "knocked down", "dysregulated",
+        "higher expression", "lower expression"
+    }
+
+    relevant = []
+    gene_pattern = "|".join(re.escape(g) for g in (genes or [])) if genes else ""
+
+    for i, sent in enumerate(sentences):
+        sent_lower = sent.lower()
+
+        # Keep if: has dysregulation term OR mentions a gene from whitelist
+        has_dys = any(term in sent_lower for term in dysregulation_terms)
+        has_gene = gene_pattern and re.search(gene_pattern, sent, re.IGNORECASE)
+
+        if has_dys or has_gene:
+            relevant.append(sent)
+
+    if not relevant:
+        # Fallback: return first 3 sentences if nothing matched filter
+        return " ".join(sentences[:3])
+
+    # Cap at max_sentences and rejoin
+    return " ".join(relevant[:max_sentences])
+
+
+
 def process_abstract_batch(args: tuple) -> list:
     """
     Hybrid processing for a batch of abstracts.
 
-    STEP 1 — One PubTator3 call for the entire batch (all PMIDs at once)
+    STEP 0 — Pre-filter: skip abstracts with no dysregulation keywords
+    STEP 1 — One PubTator3 call for the relevant PMIDs in this batch
     STEP 2 — Per abstract: LLM classifies genes found by PubTator3
               OR full LLM NER if PubTator3 had no annotations for that PMID
     """
     disease, batch = args  # batch = [{"pmid": ..., "abstract": ...}, ...]
 
-    # ── STEP 1: One PubTator3 call for all PMIDs in this batch ─────
-    pmids          = [item["pmid"] for item in batch]
-    pubtator_map   = fetch_pubtator3_genes_batch(pmids)  # {pmid: [genes]}
+    # ── STEP 0: Pre-filter — skip abstracts with no dysregulation language ──
+    relevant  = []
+    skipped   = []
+    for item in batch:
+        if _abstract_has_dysregulation(item["abstract"]):
+            relevant.append(item)
+        else:
+            skipped.append(item["pmid"])
+
+    if skipped:
+        print(f"  ⏭️  Skipped {len(skipped)} abstract(s) — no dysregulation keywords: {', '.join(skipped)}")
+
+    if not relevant:
+        return []  # entire batch filtered — no PubTator3 or LLM calls needed
+
+    # ── STEP 1: One PubTator3 call for relevant PMIDs only ──────────────────
+    pmids        = [item["pmid"] for item in relevant]
+    pubtator_map = fetch_pubtator3_genes_batch(pmids)
+
+    # ── STEP 2: Build prompts for all abstracts in this batch ────────────────
+    tasks = []
+    for item in relevant:
+        pmid           = item["pmid"]
+        abstract       = item["abstract"]
+        pubtator_genes = pubtator_map.get(pmid, [])
+
+        if pubtator_genes:
+            abstract_condensed = extract_relevant_sentences(abstract, pubtator_genes, max_sentences=5)
+            gene_list_str = ", ".join(pubtator_genes)
+            log_prefix = (
+                "  🔬 PMID " + pmid + " | 🟢 PubTator3 → " + str(len(pubtator_genes)) + " gene(s): " + gene_list_str + " → 🤖 LLM: classify UP/DOWN + BASELINE/INTERVENTION only"
+            )
+            prompt = CLASSIFICATION_PROMPT_TEMPLATE.format(
+                disease=disease, gene_list=gene_list_str, pmid=pmid, abstract=abstract_condensed
+            )
+            source = "pubtator+llm"
+        else:
+            abstract_condensed = extract_relevant_sentences(abstract, max_sentences=5)
+            log_prefix = "  🔬 PMID " + pmid + " | 🟡 PubTator3: not indexed → 🤖 LLM: full NER + classification"
+            prompt = FALLBACK_NER_PROMPT_TEMPLATE.format(
+                disease=disease, pmid=pmid, abstract=abstract_condensed
+            )
+            source = "llm_only"
+
+        tasks.append((pmid, prompt, source, log_prefix))
+
+    # ── STEP 3: LLM calls in parallel within this batch ──────────────────────
+    # Each call is fully independent — safe to parallelise.
+    # max_workers = batch size (typically 3) — never more than BATCH_SIZE concurrent calls.
+    # The next batch in ner_node.py starts only after this entire block resolves.
+    MAX_LLM_RETRIES = 3
+    LLM_RETRY_DELAY = 5.0
+
+    def invoke_one(task):
+        t_pmid, t_prompt, t_source, t_log_prefix = task
+        log = [t_log_prefix]
+        result = None
+        status = "unknown"  # success | empty | timeout | error
+
+        for attempt in range(1, MAX_LLM_RETRIES + 1):
+            try:
+                # Fresh executor per attempt — thread is fully killed after each call.
+                # shutdown(wait=True) blocks until the worker thread exits cleanly,
+                # so no lingering threads carry over to the next request.
+                _ex  = ThreadPoolExecutor(max_workers=1)
+                _fut = _ex.submit(structured_llm.invoke, t_prompt)
+                _timed_out = False
+                try:
+                    result = _fut.result(timeout=LLM_CALL_TIMEOUT)
+                except FuturesTimeoutError:
+                    _timed_out = True
+                    raise  # re-raise so the outer except catches it
+                finally:
+                    _fut.cancel()  # cancel if still pending (no-op if already done)
+                    if _timed_out:
+                        # Thread is hung — don't block waiting for it.
+                        # Abandon it and let the OS clean up eventually.
+                        _ex.shutdown(wait=False)
+                    else:
+                        # Thread finished cleanly — wait=True guarantees it is
+                        # fully dead before the next request starts.
+                        _ex.shutdown(wait=True)
+
+                if result and getattr(result, "root", None):
+                    status = "success"
+                else:
+                    status = "empty"
+                break
+
+            except FuturesTimeoutError:
+                status = "timeout"
+                if attempt < MAX_LLM_RETRIES:
+                    log.append(
+                        f"             ⏱️ LLM timed out after {LLM_CALL_TIMEOUT}s "
+                        f"(attempt {attempt}/{MAX_LLM_RETRIES}) — retrying..."
+                    )
+                    time.sleep(LLM_RETRY_DELAY)
+                else:
+                    log.append(f"             ⏱️ LLM timed out {MAX_LLM_RETRIES}x — skipping this abstract")
+                    # ── Ollama reset on timeout ───────────────────────────
+                    # The hung request is still being processed by Ollama
+                    # internally. If we don't reset, the next abstract's
+                    # request queues behind the hung one and also times out.
+                    # Solution: forcibly restart the model via Ollama API
+                    # so it starts fresh with no hung requests in its queue.
+                    with _OLLAMA_RESET_LOCK:
+                        _reset_ollama_model()
+
+            except Exception as err:
+                err_str = str(err)
+                is_cuda = "CUDA error" in err_str or "status code: 500" in err_str
+                is_ratelim = "status code: 429" in err_str or "too many concurrent" in err_str.lower()
+
+                if (is_ratelim or is_cuda) and attempt < MAX_LLM_RETRIES:
+                    wait = LLM_RETRY_DELAY * (attempt * 3 if is_ratelim else 1)
+                    tag = "🚦 Rate limited (429)" if is_ratelim else "⚠️ Ollama CUDA error"
+                    log.append(
+                        f"             {tag} (attempt {attempt}/{MAX_LLM_RETRIES}) — waiting {int(wait)}s..."
+                    )
+                    time.sleep(wait)
+                    continue
+
+                status = "error"
+                log.append(f"             ❌ Failed after {attempt} attempt(s): {err_str[:120]}")
+                result = None
+                break
+
+        if status == "success":
+            kept = [(e.gene, e.direction.value, e.evidence_type.value) for e in result.root]
+            kept_str = ", ".join([f"{g}({d},{et})" for g, d, et in kept])
+            log.append(f"             ✅ Kept {len(kept)}: {kept_str}")
+        elif status == "empty":
+            log.append("             ⚪ LLM completed — no clearly dysregulated genes found")
+        elif status == "timeout":
+            log.append("             ⏭️ Skipped due to repeated LLM timeout")
+        else:
+            log.append("             ⏭️ Skipped due to LLM error")
+
+        return t_pmid, result if status in ("success", "empty") else None, t_source, log, status
+
+    # ── Run LLM calls in parallel with staggered submission ────────────────────
+    # Problem with simultaneous parallel calls to Ollama:
+    #   All 3 fire at t=0 → Ollama queues requests 2 & 3 → they waste queue
+    #   time while the 90s timeout clock runs → false timeouts.
+    #
+    # Solution: stagger submissions by STAGGER_DELAY seconds so Ollama has
+    # time to start processing each request before the next one arrives:
+    #   t=0s:  Request 1 → Ollama starts immediately
+    #   t=5s:  Request 2 → Ollama starts (request 1 is ~halfway done)
+    #   t=10s: Request 3 → Ollama starts (request 1 nearly done)
+    #   Each request gets ~80s of actual GPU time within the 90s timeout.
+    STAGGER_DELAY = 5.0  # seconds — tune based on your avg LLM response time
 
     all_extracted = []
+    batch_results = {}
+    futures_list  = []
 
-    for item in batch:
-        pmid     = item["pmid"]
-        abstract = item["abstract"]
-        log      = []  # Buffer all log lines — print atomically to avoid thread interleaving
+    with ThreadPoolExecutor(max_workers=len(tasks)) as batch_ex:
+        for i, task in enumerate(tasks):
+            if i > 0:
+                time.sleep(STAGGER_DELAY)  # stagger submissions
+            fut = batch_ex.submit(invoke_one, task)
+            futures_list.append((task[0], fut))  # (pmid, future)
 
-        try:
-            pubtator_genes = pubtator_map.get(pmid, [])
+        # Wait for all futures in this batch to complete
+        for pmid_key, fut in futures_list:
+            pmid_r, result_r, source_r, log_r, status_r = fut.result()
+            batch_results[pmid_r] = (result_r, source_r, log_r, status_r)
 
-            # ── STEP 2a: PubTator3 found genes → LLM classifies only ──
-            if pubtator_genes:
-                gene_list_str = ", ".join(pubtator_genes)
-                log.append(f"  🔬 PMID {pmid} | 🟢 PubTator3 → {len(pubtator_genes)} gene(s): {gene_list_str}")
-                log.append(f"             → 🤖 LLM: classify UP/DOWN + BASELINE/INTERVENTION only")
-                prompt = CLASSIFICATION_PROMPT_TEMPLATE.format(
-                    disease   = disease,
-                    gene_list = gene_list_str,
-                    pmid      = pmid,
-                    abstract  = abstract
-                )
-                source = "pubtator+llm"
+    # Print logs in original PMID order for clean output
+    for task in tasks:
+        pmid = task[0]
+        result_r, source_r, log_r, status_r = batch_results[pmid]
+        print("\n".join(log_r))
+        if result_r and result_r.root:
+            for entry in result_r.root:
+                data = entry.model_dump(mode="json")
+                data["extraction_source"] = source_r
+                all_extracted.append(data)
 
-            # ── STEP 2b: No PubTator3 annotations → full LLM NER ──────
-            else:
-                log.append(f"  🔬 PMID {pmid} | 🟡 PubTator3: not indexed → 🤖 LLM: full NER + classification")
-                prompt = FALLBACK_NER_PROMPT_TEMPLATE.format(
-                    disease  = disease,
-                    pmid     = pmid,
-                    abstract = abstract
-                )
-                source = "llm_only"
-
-            # ── STEP 3: LLM call with timeout + retry ──────────────────────
-            # LangChain's invoke() has no built-in timeout — a hung Ollama
-            # request will block forever. We run it in a thread and enforce
-            # LLM_CALL_TIMEOUT seconds. On timeout or CUDA error we retry
-            # up to MAX_LLM_RETRIES times with a short backoff.
-            MAX_LLM_RETRIES = 3
-            LLM_RETRY_DELAY = 5.0
-            result = None
-
-            for llm_attempt in range(1, MAX_LLM_RETRIES + 1):
-                try:
-                    # Submit to executor WITHOUT context manager —
-                    # 'with ThreadPoolExecutor' blocks on __exit__ even after
-                    # timeout fires, which defeats the timeout entirely.
-                    # shutdown(wait=False) lets us abandon the hung thread.
-                    _executor = ThreadPoolExecutor(max_workers=1)
-                    _future   = _executor.submit(structured_llm.invoke, prompt)
-                    _executor.shutdown(wait=False)
-                    result    = _future.result(timeout=LLM_CALL_TIMEOUT)
-                    break  # success
-                except FuturesTimeoutError:
-                    is_last = llm_attempt == MAX_LLM_RETRIES
-                    if not is_last:
-                        log.append(f"             ⏱️ LLM timed out after {LLM_CALL_TIMEOUT}s (attempt {llm_attempt}/{MAX_LLM_RETRIES}) — retrying...")
-                        time.sleep(LLM_RETRY_DELAY)
-                    else:
-                        log.append(f"             ⏱️ LLM timed out {MAX_LLM_RETRIES}x — skipping this abstract")
-                        result = None
-                        break
-                except Exception as llm_err:
-                    err_str = str(llm_err)
-                    is_cuda = "CUDA error" in err_str or "status code: 500" in err_str
-                    is_last = llm_attempt == MAX_LLM_RETRIES
-
-                    if is_cuda and not is_last:
-                        log.append(f"             ⚠️ Ollama CUDA error (attempt {llm_attempt}/{MAX_LLM_RETRIES}) — waiting {LLM_RETRY_DELAY}s...")
-                        time.sleep(LLM_RETRY_DELAY)
-                    else:
-                        raise
-
-            if result and result.root:
-                kept = [(e.gene, e.direction.value, e.evidence_type.value) for e in result.root]
-                kept_str = ", ".join([f"{g}({d},{et})" for g, d, et in kept])
-                log.append(f"             ✅ Kept {len(kept)}: {kept_str}")
-                for entry in result.root:
-                    data = entry.model_dump(mode="json")
-                    data["extraction_source"] = source
-                    all_extracted.append(data)
-            else:
-                log.append(f"             ⚪ No clearly dysregulated genes found")
-
-        except Exception as e:
-            log.append(f"             ❌ Failed: {e}")
-
-        finally:
-            # Print all lines for this abstract at once — avoids interleaved output
-            print("\n".join(log))
-
-    return all_extracted
+    # Count how many abstracts timed out in this batch
+    timeout_count = sum(
+        1 for pmid_k in batch_results
+        if batch_results[pmid_k][3] == "timeout"  # index 3 = status
+    )
+    return all_extracted, timeout_count
