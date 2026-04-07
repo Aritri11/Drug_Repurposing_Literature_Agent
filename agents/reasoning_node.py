@@ -1,3 +1,4 @@
+#reasoning_node.py
 from shared.schemas import AgentState
 from shared.config import get_neo4j_driver, llm_reasoning
 from shared.helpers import get_evidence_strength
@@ -7,6 +8,11 @@ from shared.helpers import get_evidence_strength
 # 🤖 Reasoning Node
 # Queries Neo4j for evidence paths and proposes
 # top 5 repurposing candidates using LLM reasoning
+#
+# KEY DESIGN PRINCIPLE:
+#   All ranking, deduplication, and score assignment is done
+#   in Python — NEVER delegated to the LLM. The LLM only
+#   writes narrative for the pre-ranked, pre-deduplicated top 5.
 # ======================================================
 
 def reasoning_node(state: AgentState) -> AgentState:
@@ -86,170 +92,143 @@ def reasoning_node(state: AgentState) -> AgentState:
 
             rows = result.data()
 
-            # Remove rows with empty or unknown interaction type
-            rows = [
-                row for row in rows
-                if row.get("drug_gene_interaction") and row["drug_gene_interaction"].strip() != ""
-            ]
-
-            # Deduplicate by drug+gene combination — keep highest score
-            seen = {}
-            for row in rows:
-                key = f"{row['drug']}_{row['gene']}"
-                if key not in seen or row["computed_score"] > seen[key]["computed_score"]:
-                    seen[key] = row
-
-            rows = list(seen.values())
-            rows.sort(key=lambda x: x["computed_score"], reverse=True)
-
         driver.close()
 
-        # ✅ HARD STOP — only if truly empty
-        if not rows:
+        # ── Step 1: Remove rows with empty/unknown interaction type ────────────
+        rows = [
+            row for row in rows
+            if row.get("drug_gene_interaction") and row["drug_gene_interaction"].strip() != ""
+        ]
+
+        # ── Step 2: Remove direction mismatches (direction_match_score == 0) ───
+        rows = [row for row in rows if row.get("direction_match_score", 0) > 0]
+
+        # ── Step 3: Deduplicate by drug name — keep highest computed_score ─────
+        # This is done in Python, NOT delegated to the LLM
+        seen_drugs: dict[str, dict] = {}
+        for row in rows:
+            drug = row["drug"]
+            if drug not in seen_drugs or row["computed_score"] > seen_drugs[drug]["computed_score"]:
+                seen_drugs[drug] = row
+
+        # ── Step 4: Sort and take top 5 — final, authoritative ranking ─────────
+        top5 = sorted(seen_drugs.values(), key=lambda x: x["computed_score"], reverse=True)[:5]
+
+        if not top5:
             report = (
-                f"⚠️ No drug-gene-disease paths found in the knowledge graph for '{disease}'.\n"
-                f"This means DGIdb returned no interactions for the extracted genes.\n"
-                f"Cannot generate repurposing candidates without graph evidence.\n"
+                f"⚠️ No valid drug-gene-disease paths found in the knowledge graph for '{disease}'.\n"
+                f"This means either DGIdb returned no interactions for the extracted genes,\n"
+                f"or all candidates had unknown interaction types or mismatched directions.\n"
                 f"Please fix the DGIdb connection and re-run."
             )
             print(report)
             return {**state, "final_report": report}
 
-        # ✅ Only reaches here if real graph evidence exists
-        evidence_lines = []
-        for row in rows:
+        # ── Step 5: Build structured evidence block for the LLM ───────────────
+        # Scores, ranks, and labels are ALL pre-computed here.
+        # The LLM receives fixed facts — it must only write narrative text.
+        evidence_blocks = []
+        for rank, row in enumerate(top5, start=1):
             drug_action    = row["drug_gene_interaction"]
             gene_direction = row["gene_disease_direction"]
+            score          = int(row["computed_score"])
+            d_score        = row["direction_match_score"]
 
-            if row["direction_match_score"] == 1.0:
+            if d_score == 1.0:
                 direction_label = (
-                    f"✅ PERFECT MATCH — "
-                    f"Gene is {gene_direction} in {disease}, "
+                    f"✅ PERFECT MATCH — Gene is {gene_direction} in {disease}, "
                     f"Drug is a {drug_action} → correct therapeutic direction"
-                )
-            elif row["direction_match_score"] == 0.2:
-                direction_label = (
-                    f"⚠️ PARTIAL MATCH — "
-                    f"Gene is {gene_direction} in {disease}, "
-                    f"Drug action '{drug_action}' direction is unclear"
                 )
             else:
                 direction_label = (
-                    f"❌ NO MATCH — "
-                    f"Gene is {gene_direction} in {disease}, "
-                    f"Drug '{drug_action}' action works in wrong direction"
+                    f"⚠️ PARTIAL MATCH — Gene is {gene_direction} in {disease}, "
+                    f"Drug action '{drug_action}' direction is partially unclear"
                 )
 
             approved_label    = "✅ FDA Approved" if row.get("drug_approved") else "🔬 Experimental"
-            evidence_strength = get_evidence_strength(row["computed_score"])
-            conflicted        = row.get("conflicted", False)
-            conflict_label    = " ⚠️ CONFLICTED DIRECTION" if conflicted else ""
-            gene_dir_label = "Upregulated" if row["gene_disease_direction"] == "UP" else "Downregulated"
+            evidence_strength = get_evidence_strength(score)
+            gene_dir_label    = "Upregulated" if gene_direction == "UP" else "Downregulated"
+            # Clean PMIDs — strip URLs, whitespace, and JSON garbage
+            # that can accumulate if the KG stored dirty data
+            raw_pmids = row.get("pmids") or []
+            clean_pmids = []
+            for p in raw_pmids:
+                p = str(p).strip()
+                # Extract bare numeric PMID from URLs like https://...pubmed/12345678
+                if "pubmed" in p.lower():
+                    p = p.rstrip("/").split("/")[-1]
+                # Keep only if it looks like a real PMID (pure digits, 7-8 chars)
+                if p.isdigit() and 6 <= len(p) <= 9:
+                    clean_pmids.append(p)
+            pmids_str = ", ".join(clean_pmids) if clean_pmids else "N/A"
+            conflict_label    = " ⚠️ CONFLICTED DIRECTION" if row.get("conflicted") else ""
 
-            line = (
-                f"Drug: {row['drug']} | "
-                f"Approval: {approved_label} | "
-                f"Gene: {row['gene']}{conflict_label} | "
-                f"Drug→Gene: {drug_action} | "
-                f"Gene in {disease}: {gene_dir_label} | "
-                f"Direction match: {direction_label} | "
-                f"Evidence count: {row['evidence_count']} | "
-                f"Pre-computed score: {row['computed_score']}/100 | "
-                f"Evidence Strength: {evidence_strength} | "
-                f"PMIDs: {', '.join(row['pmids'] or [])}"
-            )
-            evidence_lines.append(line)
+            block = f"""RANK {rank}:
+Drug: {row['drug']}
+Approval: {approved_label}
+Gene: {row['gene']}{conflict_label}
+Gene in {disease}: {gene_dir_label}
+Drug→Gene interaction: {drug_action}
+Direction match: {direction_label}
+Evidence count: {row['evidence_count']}
+Pre-computed score: {score}/100
+Evidence strength: {evidence_strength}
+PMIDs: {pmids_str}"""
 
-        evidence_text = "\n".join(evidence_lines)
+            evidence_blocks.append(block)
 
-        reasoning_prompt = f"""
-You are a drug repurposing expert and a clinical pharmacologist.
+            # Print the pre-computed top 5 to console for verification
+            print(f"  #{rank} {row['drug']} → {row['gene']} | score={score} | {drug_action} | {gene_dir_label}")
 
-Below is knowledge graph evidence for {disease}.
-Each line shows: Drug → Gene Target → Gene's role in {disease}
-The evidence below or the pre-computed score (0-100) for each candidate has already been scored by a multi-factor algorithm:
-  - Direction match (35%): Does drug action oppose gene's disease role?
-  - Literature support (30%): How many PubMed papers confirm gene-disease link? (capped at 10)
-  - Data quality (20%): Is the drug-gene interaction type explicitly known?
-  - DGIdb confidence (15%): DGIdb's own internal interaction confidence score
+        evidence_text = "\n\n".join(evidence_blocks)
 
-CRITICAL RULE:
-- If Drug→Gene interaction type is empty, unknown, or unspecified → SKIP that candidate entirely.
-- Only reason over candidates where the interaction type is explicitly known (inhibitor, activator, agonist, antagonist etc.)
-- Do NOT use your own training knowledge to fill in missing interaction types.
-- Use the pre-computed score as your primary ranking basis
-- Do NOT invent or modify scores
-- Do NOT use candidates where Direction match = ❌ NO MATCH
-- Do NOT fill in missing interaction types from your own knowledge
-- Every claim must trace back to the PMIDs listed
-- If a gene is marked ⚠️ CONFLICTED DIRECTION, lower its confidence —
-  literature disagrees on whether it is UP or DOWN in this disease.
-  Mention the conflict in your explanation.
+        # ── Step 6: LLM prompt — narrative only, no ranking decisions ─────────
+        # Format is enforced with an explicit TEMPLATE the LLM must fill in.
+        # This prevents field collapsing by smaller models.
+        reasoning_prompt = f"""You are a drug repurposing expert and clinical pharmacologist.
 
-KEY LOGIC:
-- If gene is DOWNREGULATED in disease + Drug ACTIVATES gene → ✅ Good candidate
-- If gene is UPREGULATED in disease   + Drug INHIBITS gene  → ✅ Good candidate
-- Empty interaction type → ❌ Skip entirely
-- Mismatched direction = ❌ Wrong candidate
+The top 5 repurposing candidates for {disease} have been pre-ranked by a validated algorithm.
+Your ONLY job is to fill in the 4 narrative fields marked [FILL] for each rank.
+All other fields are fixed — copy them VERBATIM. Do NOT change order, scores, or PMIDs.
 
-EVIDENCE (sorted by pre-computed score, highest first):
+Use EXACTLY this template for each rank, replacing [FILL] with your text:
+
+---
+RANK [N]
+- Drug Name: [copy]
+- Current Approved Use: [copy]
+- Target Gene: [copy]
+- Gene in {disease}: [copy]
+- Drug→Gene Interaction: [copy]
+- Direction Match: [copy]
+- Pre-computed Score: [copy]
+- Evidence Strength: [copy]
+- Supporting PMIDs: [copy]
+- Gene's Role in {disease}: [FILL — (a) normal function, (b) how dysregulation drives {disease}, (c) why valid target]
+- Treatment Hypothesis: [FILL — 2-3 sentences: drug mechanism → gene correction → disease improvement]
+- Known Risks in {disease}: [FILL — specific risks for this patient population, or "No known disease-specific risks identified"]
+- Recommended Next Step: [FILL — specific and actionable: Phase II trial / animal model / IND application / in vitro validation]
+---
+
+PRE-RANKED EVIDENCE:
 {evidence_text}
 
-IMPORTANT: Each drug should appear only ONCE in the top 5.
-If the same drug targets multiple genes, pick the gene-disease path
-with the highest pre-computed score and use only that one.
-
-The evidence below is ALREADY sorted by pre-computed score, highest first.
-You MUST present the top 5 in EXACTLY the order they appear in the evidence.
-Do NOT re-rank, re-sort, or change the order for any reason.
-RANK 1 = first item in evidence, RANK 2 = second item, and so on.
-
-RANK X:
-- Drug Name: [just the drug name alone]
-- Current Approved Use: [copy exactly from evidence — either ✅ FDA Approved or 🔬 Experimental]
-- Target Gene: [just the gene symbol]
-- Gene's Role in {disease}:
-  [Start with Upregulated/Downregulated as stated in evidence. Then explain:
-   (a) what this gene normally does in healthy tissue
-   (b) how its dysregulation contributes to {disease} pathology
-   (c) why it is a valid therapeutic target]
-- Treatment Hypothesis:
-  [In 2-3 sentences, explain the precise mechanism by which this drug could 
-   benefit a {disease} patient. Connect:
-   drug mechanism → gene correction → disease pathology improvement.
-   Example: "By inhibiting X, this drug reduces Y, which directly addresses 
-   the Z dysfunction seen in {disease}."]
-- Known Risks in {disease}:
-  [List any known side effects of this drug that could specifically worsen 
-   {disease} symptoms or create dangerous interactions in this patient 
-   population. If none are known, state: "No known disease-specific risks 
-   identified — general safety profile applies."]
-- Direction Match: [copy exactly from evidence — includes gene direction and drug action]
-- Pre-computed Score (Confidence Score[0-100]): [copy exactly from evidence]
-- Evidence Strength: [copy exactly from evidence — 🟢 High / 🟡 Medium / 🔴 Low]
-- Supporting PMIDs: [copy exactly]
-- Recommended Next Step:
-  [Give a SPECIFIC, actionable recommendation — not generic. Choose the most 
-   appropriate one based on evidence strength and approval status:
-   • If FDA Approved + High evidence → suggest specific Phase II/III trial design
-   • If FDA Approved + Medium evidence → suggest in vivo animal model study
-   • If Experimental + High evidence → suggest IND application pathway
-   • If Experimental + Low evidence → suggest in vitro mechanistic validation
-   Always mention the gene target and disease context specifically.]
-
-
-Format clearly as RANK 1 through RANK 5.
+Now fill in the template for RANK 1 through RANK 5. Do not skip any field. Do not merge fields.
 """
 
-        response     = llm_reasoning.invoke(reasoning_prompt)
-        final_report = response.content
+        response      = llm_reasoning.invoke(reasoning_prompt)
+        llm_content   = response.content
+
+        # Strip <think> block if present (deepseek-r1 style)
+        if "<think>" in llm_content:
+            llm_content = llm_content.split("</think>")[-1].strip()
 
         print("\n" + "="*60)
         print(f"🏆 TOP 5 REPURPOSING CANDIDATES FOR: {disease}")
         print("="*60)
-        print(final_report)
+        print(llm_content)
 
-        return {**state, "final_report": final_report}
+        return {**state, "final_report": llm_content}
 
     except Exception as e:
         print(f"❌ Reasoning failed: {e}")
