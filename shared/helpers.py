@@ -13,10 +13,60 @@ from shared.schemas import structured_llm
 from shared.config import llm_ner as _llm_ner  # used to read model name only
 _NER_MODEL = _llm_ner.model  # e.g. "llama3.1:8b" — read once at import time
 
+# ── NER result cache ──────────────────────────────────────────────────────────
+# Persists LLM results to disk so re-running the same disease reuses
+# previous results. Keyed by "disease::pmid".
+import json as _json, os as _os
+
+_CACHE_PATH  = _os.path.join(_os.path.dirname(__file__), "ner_cache.json")
+_NER_CACHE: dict  = {}
+_CACHE_DIRTY: bool = False
+
+def _load_ner_cache():
+    global _NER_CACHE
+    try:
+        if _os.path.exists(_CACHE_PATH):
+            with open(_CACHE_PATH, "r") as f:
+                _NER_CACHE = _json.load(f)
+    except Exception:
+        _NER_CACHE = {}
+
+def _save_ner_cache():
+    try:
+        with open(_CACHE_PATH, "w") as f:
+            _json.dump(_NER_CACHE, f)
+    except Exception as e:
+        print(f"⚠️  Cache save failed: {e}")
+
+_load_ner_cache()  # load once at import time
+
 import threading
 _OLLAMA_RESET_LOCK = threading.Lock()
 # How long to wait for a single LLM call before declaring it hung (seconds)
-LLM_CALL_TIMEOUT = 90
+LLM_CALL_TIMEOUT_BASE = 90  # kept for reference
+
+def _get_timeout_for_genes(gene_count: int) -> float:
+    """
+    Compute LLM timeout dynamically based on number of genes to classify.
+    Each gene = one structured JSON object to generate.
+    More genes = longer generation time needed.
+
+        0-5   genes → 90s
+        6-10  genes → 120s
+        11-15 genes → 150s
+        16-20 genes → 200s
+        21+   genes → 270s
+    """
+    if gene_count <= 5:
+        return 90.0
+    elif gene_count <= 10:
+        return 120.0
+    elif gene_count <= 15:
+        return 150.0
+    elif gene_count <= 20:
+        return 200.0
+    else:
+        return 270.0
 
 
 # ======================================================
@@ -266,66 +316,31 @@ Return structured output only. If nothing qualifies, return an empty list."""
 # subsequent abstracts after a single hung one.
 # ======================================================
 
-def _reset_ollama_model(model: str = None, wait_before_reload: float = 3.0):
+def _reset_ollama_model(model: str = None, wait: float = 20.0):
     """
-    Force-reset Ollama model to clear stuck/hung generations:
-      1) unload model   (keep_alive=0)
-      2) short wait
-      3) reload model   (tiny prompt, keep_alive=-1)
+    Wait for Ollama to clear any hung request, then confirm responsive.
+    Does NOT unload/reload — that causes VRAM conflicts when deepseek-r1:8b
+    is also loaded, leading to 60s+ reload timeouts.
     """
     if model is None:
         model = _NER_MODEL
-
     try:
-        import requests as _req
-
-        print(f"             🔄 Resetting Ollama model: {model}")
-
-        # 1) Unload model (kills queued/hung work for this model)
-        try:
-            r_unload = _req.post(
-                "http://localhost:11434/api/generate",
-                json={
-                    "model": model,
-                    "prompt": "",        # empty prompt is fine for keep_alive control
-                    "stream": False,
-                    "keep_alive": 0
-                },
-                timeout=20
-            )
-            print(f"             📤 Unload status: {r_unload.status_code}")
-        except Exception as e:
-            print(f"             ⚠️  Unload request failed: {e}")
-
-        # 2) brief pause so Ollama can finalize unload
-        time.sleep(wait_before_reload)
-
-        # 3) Reload + warm model in memory
-        try:
-            r_reload = _req.post(
-                "http://localhost:11434/api/generate",
-                json={
-                    "model": model,
-                    "prompt": "OK",
-                    "stream": False,
-                    "keep_alive": -1
-                },
-                timeout=60
-            )
-            if r_reload.status_code == 200:
-                print("             ✅ Ollama model reloaded and responsive")
-            else:
-                print(f"             ⚠️  Reload returned status {r_reload.status_code}")
-        except Exception as e:
-            print(f"             ⚠️  Reload request failed: {e}")
-
+        print(f"             \u23f3 Waiting {wait}s for Ollama queue to clear...")
+        time.sleep(wait)
+        r = requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": model, "keep_alive": -1, "prompt": "", "stream": False},
+            timeout=15
+        )
+        if r.status_code == 200:
+            print(f"             \u2705 Ollama responsive \u2014 resuming")
+        else:
+            print(f"             \u26a0\ufe0f  Ollama ping returned {r.status_code}")
     except Exception as e:
-        print(f"             ⚠️  Ollama reset failed (non-fatal): {e}")
+        print(f"             \u26a0\ufe0f  Ollama ping failed (non-fatal): {e}")
 
-# ── Keywords that signal an abstract is worth processing ─────────────────────
-# Abstract must contain at least one expression-change word to be worth
-# sending to PubTator3 or the LLM. Abstracts about drug mechanisms,
-# reviews, or gene therapy with no dysregulation language are skipped early.
+
+# ── Dysregulation keywords (basic check) ──────────────────────────────────────
 _DYSREGULATION_KEYWORDS = {
     "upregulated", "downregulated", "overexpressed", "underexpressed",
     "increased expression", "decreased expression", "elevated", "reduced",
@@ -335,65 +350,157 @@ _DYSREGULATION_KEYWORDS = {
     "higher expression", "lower expression", "gene expression",
 }
 
-def _abstract_has_dysregulation(abstract: str) -> bool:
+# ── Explicit dysregulation phrases → near-certain to yield LLM result ─────────
+# These are specific enough that if present, LLM almost always finds a gene.
+_EXPLICIT_PHRASES = [
+    "was upregulated", "were upregulated", "is upregulated",
+    "was downregulated", "were downregulated", "is downregulated",
+    "was overexpressed", "were overexpressed",
+    "was underexpressed", "were underexpressed",
+    "significantly upregulated", "significantly downregulated",
+    "significantly increased expression", "significantly decreased expression",
+    "expression was increased", "expression was decreased",
+    "expression was elevated", "expression was reduced",
+    "mrna levels were", "protein levels were",
+    "mrna expression was", "protein expression was",
+    "differentially expressed",
+    "increased expression of", "decreased expression of",
+    "upregulation of", "downregulation of", "overexpression of",
+    "higher expression of", "lower expression of",
+]
+
+# ── Abstract types that almost never have baseline gene dysregulation ──────────
+_SKIP_ABSTRACT_TYPES = [
+    "systematic review", "meta-analysis", "randomized controlled trial",
+    "clinical trial", "vaccine efficacy", "pharmacokinetics",
+    "drug resistance", "antimicrobial", "case report", "case series",
+    "epidemiology", "seroprevalence", "diagnostic accuracy",
+]
+
+# ── Direction words for proximity check around gene names ─────────────────────
+_DIRECTION_WORDS = {
+    "upregulated", "downregulated", "overexpressed", "underexpressed",
+    "increased", "decreased", "elevated", "reduced", "suppressed",
+    "activated", "inhibited", "upregulation", "downregulation",
+    "higher", "lower", "diminished", "enhanced", "overexpression",
+}
+
+
+def _get_signal_strength(abstract: str) -> str:
     """
-    Fast keyword pre-filter — returns True if the abstract contains
-    at least one expression-change term. Skips PubTator3 + LLM calls
-    for abstracts that clearly have no dysregulation content.
+    Classify abstract signal strength before any API call.
+
+    'strong' -> explicit dysregulation phrase found -> always call LLM
+    'weak'   -> generic expression language only -> call LLM only if
+                PubTator3 found genes AND proximity check passes
+    'none'   -> no dysregulation signal OR irrelevant abstract type -> skip
+
+    This eliminates two common wasted LLM calls:
+      Situation 1: PubTator3 not indexed + LLM finds nothing
+                   (weak signal abstracts with no genes get skipped)
+      Situation 2: PubTator3 found genes + LLM finds nothing
+                   (genes merely mentioned, not near direction words)
     """
     text = abstract.lower()
-    return any(kw in text for kw in _DYSREGULATION_KEYWORDS)
+
+    # Skip known irrelevant abstract types entirely
+    if any(skip in text for skip in _SKIP_ABSTRACT_TYPES):
+        return "none"
+
+    # Strong: explicit dysregulation phrase present
+    if any(phrase in text for phrase in _EXPLICIT_PHRASES):
+        return "strong"
+
+    # Weak: only generic expression/regulation language
+    if any(kw in text for kw in _DYSREGULATION_KEYWORDS):
+        return "weak"
+
+    return "none"
 
 
-# ======================================================
-# 🔧 Helper: Extract relevant sentences (token reduction)
-# ======================================================
-
-def extract_relevant_sentences(abstract: str, genes: list[str] = None, max_sentences: int = 5) -> str:
+def _gene_has_direction_context(gene_name: str, abstract: str, window: int = 150) -> bool:
     """
-    Extract only sentences with gene mentions + dysregulation keywords.
-    Reduces token count sent to LLM by 60–80%.
+    Check if a direction word appears within `window` characters of the
+    gene name in the abstract.
 
-    Args:
-        abstract: Full abstract text
-        genes: List of gene names to look for (whitelist)
-        max_sentences: Cap output at this many sentences
-
-    Returns:
-        Compact string of relevant sentences only
+    Fixes Situation 2: PubTator3 finds genes like 'GM-Vac, THRIL' that
+    are merely mentioned in background/methods — no direction word nearby.
+    Returns False -> skip LLM call -> no wasted inference.
     """
-    sentences = sent_tokenize(abstract)
+    text = abstract.lower()
+    gene = gene_name.lower()
+    idx  = text.find(gene)
 
+    while idx != -1:
+        start   = max(0, idx - window)
+        end     = min(len(text), idx + len(gene) + window)
+        context = text[start:end]
+        if any(dw in context for dw in _DIRECTION_WORDS):
+            return True
+        idx = text.find(gene, idx + 1)
+
+    return False
+
+
+def _any_gene_has_direction_context(genes: list, abstract: str) -> bool:
+    """Returns True if ANY gene in the list has a direction word nearby."""
+    return any(_gene_has_direction_context(g, abstract) for g in genes)
+
+
+def _abstract_has_dysregulation(abstract: str) -> bool:
+    """Legacy helper — kept for backward compatibility."""
+    return _get_signal_strength(abstract) != "none"
+
+def extract_relevant_sentences(abstract: str, gene_names: list = None, max_sentences: int = 5) -> str:
+    """
+    Extract only the sentences most relevant to gene dysregulation.
+    Reduces prompt length sent to LLM, speeding up inference.
+
+    Strategy:
+    - Keep sentences containing direction words (upregulated, decreased etc.)
+    - If gene_names provided, prioritise sentences mentioning those genes
+    - Cap at max_sentences to keep prompt short
+    - Fall back to full abstract if no relevant sentences found
+    """
+    import re
+
+    sentences = re.split(r"(?<=[.!?])\s+", abstract.strip())
     if not sentences:
-        return abstract  # Fallback if tokenization fails
+        return abstract
 
-    dysregulation_terms = {
+    direction_words = {
         "upregulated", "downregulated", "overexpressed", "underexpressed",
         "increased", "decreased", "elevated", "reduced", "suppressed",
-        "activated", "inhibited", "silenced", "knocked down", "dysregulated",
-        "higher expression", "lower expression"
+        "activated", "inhibited", "upregulation", "downregulation",
+        "differentially expressed", "higher expression", "lower expression",
     }
 
-    relevant = []
-    gene_pattern = "|".join(re.escape(g) for g in (genes or [])) if genes else ""
+    scored = []
+    gene_names_lower = [g.lower() for g in (gene_names or [])]
 
-    for i, sent in enumerate(sentences):
+    for sent in sentences:
         sent_lower = sent.lower()
+        score = 0
 
-        # Keep if: has dysregulation term OR mentions a gene from whitelist
-        has_dys = any(term in sent_lower for term in dysregulation_terms)
-        has_gene = gene_pattern and re.search(gene_pattern, sent, re.IGNORECASE)
+        # Score: direction word present
+        if any(dw in sent_lower for dw in direction_words):
+            score += 2
 
-        if has_dys or has_gene:
-            relevant.append(sent)
+        # Score: gene name mentioned
+        if any(g in sent_lower for g in gene_names_lower):
+            score += 1
 
-    if not relevant:
-        # Fallback: return first 3 sentences if nothing matched filter
-        return " ".join(sentences[:3])
+        if score > 0:
+            scored.append((score, sent))
 
-    # Cap at max_sentences and rejoin
-    return " ".join(relevant[:max_sentences])
+    # Sort by score descending, take top max_sentences
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top_sentences = [s for _, s in scored[:max_sentences]]
 
+    if not top_sentences:
+        return abstract  # fallback — return full abstract
+
+    return " ".join(top_sentences)
 
 
 def process_abstract_batch(args: tuple) -> list:
@@ -405,33 +512,57 @@ def process_abstract_batch(args: tuple) -> list:
     STEP 2 — Per abstract: LLM classifies genes found by PubTator3
               OR full LLM NER if PubTator3 had no annotations for that PMID
     """
+    global _NER_CACHE, _CACHE_DIRTY
     disease, batch = args  # batch = [{"pmid": ..., "abstract": ...}, ...]
 
-    # ── STEP 0: Pre-filter — skip abstracts with no dysregulation language ──
-    relevant  = []
-    skipped   = []
+    # ── STEP 0: Two-stage pre-filter ────────────────────────────────────────
+    # Strong signal → always send to LLM
+    # Weak signal   → only send if PubTator3 finds genes (confirms relevance)
+    # No signal     → skip entirely (~40% of LLM calls eliminated this way)
+    relevant = []   # [(item, signal_strength), ...]
+    skipped  = []
+
     for item in batch:
-        if _abstract_has_dysregulation(item["abstract"]):
-            relevant.append(item)
-        else:
+        strength = _get_signal_strength(item["abstract"])
+        if strength == "none":
             skipped.append(item["pmid"])
+        else:
+            relevant.append((item, strength))
 
     if skipped:
         print(f"  ⏭️  Skipped {len(skipped)} abstract(s) — no dysregulation keywords: {', '.join(skipped)}")
 
     if not relevant:
-        return []  # entire batch filtered — no PubTator3 or LLM calls needed
+        return [], 0
 
     # ── STEP 1: One PubTator3 call for relevant PMIDs only ──────────────────
-    pmids        = [item["pmid"] for item in relevant]
+    pmids        = [item["pmid"] for item, _ in relevant]
     pubtator_map = fetch_pubtator3_genes_batch(pmids)
 
     # ── STEP 2: Build prompts for all abstracts in this batch ────────────────
     tasks = []
-    for item in relevant:
+    for item, signal_strength in relevant:
         pmid           = item["pmid"]
         abstract       = item["abstract"]
         pubtator_genes = pubtator_map.get(pmid, [])
+
+        # ── Stage B: context-aware skip ─────────────────────────────────────
+        #
+        # Situation 1 — PubTator3 not indexed + weak signal:
+        #   No genes found AND no explicit dysregulation phrase
+        #   → LLM almost certainly returns empty → skip
+        #
+        # Situation 2 — PubTator3 found genes but none near a direction word:
+        #   Genes are merely mentioned (background/methods), not reported as
+        #   dysregulated. Proximity check confirms → skip LLM entirely.
+        #
+        if not pubtator_genes and signal_strength == "weak":
+            print(f"  ⏭️  PMID {pmid} | weak signal + not indexed → skipping LLM")
+            continue
+
+        if pubtator_genes and not _any_gene_has_direction_context(pubtator_genes, abstract):
+            print(f"  ⏭️  PMID {pmid} | genes found but none near direction words → skipping LLM")
+            continue
 
         if pubtator_genes:
             abstract_condensed = extract_relevant_sentences(abstract, pubtator_genes, max_sentences=5)
@@ -451,7 +582,12 @@ def process_abstract_batch(args: tuple) -> list:
             )
             source = "llm_only"
 
-        tasks.append((pmid, prompt, source, log_prefix))
+        gene_count = len(pubtator_genes) if pubtator_genes else 0
+        tasks.append((pmid, prompt, source, log_prefix, gene_count))
+
+    # ✅ guard for empty tasks
+    if not tasks:
+        return [], 0
 
     # ── STEP 3: LLM calls in parallel within this batch ──────────────────────
     # Each call is fully independent — safe to parallelise.
@@ -461,7 +597,8 @@ def process_abstract_batch(args: tuple) -> list:
     LLM_RETRY_DELAY = 5.0
 
     def invoke_one(task):
-        t_pmid, t_prompt, t_source, t_log_prefix = task
+        t_pmid, t_prompt, t_source, t_log_prefix, t_gene_count = task
+        dynamic_timeout = _get_timeout_for_genes(t_gene_count)
         log = [t_log_prefix]
         result = None
         status = "unknown"  # success | empty | timeout | error
@@ -475,7 +612,7 @@ def process_abstract_batch(args: tuple) -> list:
                 _fut = _ex.submit(structured_llm.invoke, t_prompt)
                 _timed_out = False
                 try:
-                    result = _fut.result(timeout=LLM_CALL_TIMEOUT)
+                    result = _fut.result(timeout=dynamic_timeout)
                 except FuturesTimeoutError:
                     _timed_out = True
                     raise  # re-raise so the outer except catches it
@@ -500,12 +637,12 @@ def process_abstract_batch(args: tuple) -> list:
                 status = "timeout"
                 if attempt < MAX_LLM_RETRIES:
                     log.append(
-                        f"             ⏱️ LLM timed out after {LLM_CALL_TIMEOUT}s "
+                        f"             ⏱️ LLM timed out after {dynamic_timeout:.0f}s "
                         f"(attempt {attempt}/{MAX_LLM_RETRIES}) — retrying..."
                     )
                     time.sleep(LLM_RETRY_DELAY)
                 else:
-                    log.append(f"             ⏱️ LLM timed out {MAX_LLM_RETRIES}x — skipping this abstract")
+                    log.append(f"             ⏱️ LLM timed out {MAX_LLM_RETRIES}x (limit={dynamic_timeout:.0f}s) — skipping this abstract")
                     # ── Ollama reset on timeout ───────────────────────────
                     # The hung request is still being processed by Ollama
                     # internally. If we don't reset, the next abstract's
@@ -578,14 +715,22 @@ def process_abstract_batch(args: tuple) -> list:
 
     # Print logs in original PMID order for clean output
     for task in tasks:
-        pmid = task[0]
+        pmid      = task[0]
         result_r, source_r, log_r, status_r = batch_results[pmid]
         print("\n".join(log_r))
+        cache_key_r = disease + "::" + pmid
         if result_r and result_r.root:
+            entries = []
             for entry in result_r.root:
                 data = entry.model_dump(mode="json")
                 data["extraction_source"] = source_r
+                entries.append(data)
                 all_extracted.append(data)
+            _NER_CACHE[cache_key_r] = entries  # cache result
+            _CACHE_DIRTY = True
+        else:
+            _NER_CACHE[cache_key_r] = []       # cache empty result
+            _CACHE_DIRTY = True
 
     # Count how many abstracts timed out in this batch
     timeout_count = sum(
